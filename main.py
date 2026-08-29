@@ -1,3 +1,7 @@
+import os
+import time
+import json
+import asyncio
 from contextlib import asynccontextmanager
 from typing import Any, Dict, List, Optional
 
@@ -20,11 +24,9 @@ GEMINI_API_VERSION = "v1beta"
 # =========================================================
 # API KEYS
 #
-# Zeabur 环境变量：
+# Zeabur:
 #
 # GEMINI_API_KEYS=key1,key2,key3
-#
-# 支持一个或多个 Key
 # =========================================================
 
 keys_env = os.environ.get(
@@ -40,12 +42,7 @@ API_KEYS = [
 
 
 # =========================================================
-# KEY 轮换
-#
-# 每次新请求从不同 Key 开始。
-#
-# 如果当前 Key 请求失败：
-# 自动继续下一个 Key。
+# KEY ROTATION
 # =========================================================
 
 _key_index = 0
@@ -79,11 +76,6 @@ async def get_key_order() -> List[str]:
 
 # =========================================================
 # HTTP CLIENT
-#
-# 使用一个长期存在的 httpx client。
-#
-# 不再使用 google-genai Python SDK。
-# 直接请求 Gemini REST API。
 # =========================================================
 
 @asynccontextmanager
@@ -123,27 +115,20 @@ app = FastAPI(
 
 # =========================================================
 # CORS
-#
-# 对齐之前正常工作的 Cloudflare Worker。
 # =========================================================
 
 app.add_middleware(
     CORSMiddleware,
-
     allow_origins=["*"],
-
     allow_credentials=False,
-
     allow_methods=["*"],
-
     allow_headers=["*"],
-
     expose_headers=["*"],
 )
 
 
 # =========================================================
-# OPENAI REQUEST STRUCTURE
+# OPENAI REQUEST
 # =========================================================
 
 class ChatMessage(BaseModel):
@@ -162,19 +147,7 @@ class ChatMessage(BaseModel):
 class ChatRequest(BaseModel):
 
     # =====================================================
-    # 模型完全透传
-    #
-    # Chatbox 传：
-    #
-    # gemini-3.7-flash
-    #
-    # 就请求：
-    #
-    # gemini-3.7-flash
-    #
-    # 不替换
-    # 不映射
-    # 不设默认模型
+    # MODEL 完全透传
     # =====================================================
 
     model: str
@@ -183,28 +156,16 @@ class ChatRequest(BaseModel):
 
 
     # =====================================================
-    # 非常重要
+    # stream=true 才流式
     #
-    # 不默认 True。
-    #
-    # stream=true
-    #     → SSE
-    #
-    # stream=false
-    #     → JSON
-    #
-    # 没传 stream
-    #     → JSON
-    #
-    # 这个行为与正常工作的 CF Worker 一致。
+    # false / 没传：
+    # 返回普通 JSON
     # =====================================================
 
     stream: Optional[bool] = None
 
 
     # =====================================================
-    # THINKING
-    #
     # 默认 HIGH
     # =====================================================
 
@@ -212,7 +173,7 @@ class ChatRequest(BaseModel):
 
 
     # =====================================================
-    # OPENAI 常见参数
+    # OpenAI 常见参数
     # =====================================================
 
     temperature: Optional[float] = None
@@ -254,17 +215,6 @@ def extract_text_content(
         return content
 
 
-    # =====================================================
-    # OpenAI content array
-    #
-    # [
-    #   {
-    #       "type": "text",
-    #       "text": "hello"
-    #   }
-    # ]
-    # =====================================================
-
     if isinstance(
         content,
         list
@@ -278,6 +228,7 @@ def extract_text_content(
                 item,
                 dict
             ):
+
                 continue
 
             if item.get(
@@ -300,16 +251,12 @@ def extract_text_content(
             texts
         )
 
+
     return str(content)
 
 
 # =========================================================
 # OPENAI MESSAGES → GEMINI
-#
-# system     → systemInstruction
-# developer  → systemInstruction
-# user       → user
-# assistant  → model
 # =========================================================
 
 def transform_messages(
@@ -331,7 +278,7 @@ def transform_messages(
 
 
         # =================================================
-        # SYSTEM
+        # SYSTEM / DEVELOPER
         # =================================================
 
         if msg.role in (
@@ -354,82 +301,18 @@ def transform_messages(
 
         if msg.role == "assistant":
 
-            contents.append(
-                {
-                    "role":
-                        "model",
+            role = "model"
 
-                    "parts":
-                        [
-                            {
-                                "text":
-                                    text
-                            }
-                        ],
-                }
-            )
+        else:
 
-            continue
+            # user / tool / unknown
+            role = "user"
 
-
-        # =================================================
-        # USER
-        # =================================================
-
-        if msg.role == "user":
-
-            contents.append(
-                {
-                    "role":
-                        "user",
-
-                    "parts":
-                        [
-                            {
-                                "text":
-                                    text
-                            }
-                        ],
-                }
-            )
-
-            continue
-
-
-        # =================================================
-        # TOOL
-        #
-        # 当前按文本继续放进上下文。
-        # =================================================
-
-        if msg.role == "tool":
-
-            contents.append(
-                {
-                    "role":
-                        "user",
-
-                    "parts":
-                        [
-                            {
-                                "text":
-                                    text
-                            }
-                        ],
-                }
-            )
-
-            continue
-
-
-        # =================================================
-        # UNKNOWN ROLE
-        # =================================================
 
         contents.append(
             {
                 "role":
-                    "user",
+                    role,
 
                 "parts":
                     [
@@ -441,10 +324,6 @@ def transform_messages(
             }
         )
 
-
-    # =====================================================
-    # 防止只有 system message
-    # =====================================================
 
     if not contents:
 
@@ -463,10 +342,6 @@ def transform_messages(
             }
         )
 
-
-    # =====================================================
-    # SYSTEM INSTRUCTION
-    # =====================================================
 
     system_instruction = None
 
@@ -494,7 +369,7 @@ def transform_messages(
 
 
 # =========================================================
-# GEMINI REQUEST BODY
+# GEMINI BODY
 # =========================================================
 
 def build_gemini_body(
@@ -604,14 +479,6 @@ def build_gemini_body(
         ] = req.seed
 
 
-    # =====================================================
-    # Gemini 3 官方建议保持默认 temperature。
-    #
-    # 所以这里不会把 Chatbox 的
-    # temperature / top_p / top_k 强行塞进去。
-    # =====================================================
-
-
     body: Dict[str, Any] = {
 
         "contents":
@@ -622,6 +489,7 @@ def build_gemini_body(
 
         "safetySettings":
             [
+
                 {
                     "category":
                         "HARM_CATEGORY_HATE_SPEECH",
@@ -668,7 +536,7 @@ def build_gemini_body(
 
 
 # =========================================================
-# OPENAI COMPLETION ID
+# ID
 # =========================================================
 
 def make_completion_id() -> str:
@@ -742,15 +610,88 @@ def map_finish_reason(
 
 
 # =========================================================
-# GEMINI CANDIDATE → OPENAI CHOICE
+# 判断 candidate 是否真的有内容
 #
-# 这里按照你正常工作的 CF Worker 的结构：
+# 这是本次最关键的修改之一。
 #
-# role
-# content
-# tool_calls
-# logprobs
-# finish_reason
+# candidate 存在但：
+#
+# parts=[]
+#
+# 或
+#
+# text=""
+#
+# 不再认为是成功回答。
+# =========================================================
+
+def candidate_has_payload(
+    candidate: Dict[str, Any]
+) -> bool:
+
+    content = (
+        candidate.get(
+            "content"
+        )
+        or {}
+    )
+
+
+    parts = (
+        content.get(
+            "parts"
+        )
+        or []
+    )
+
+
+    for part in parts:
+
+
+        # 工具调用也属于有效输出
+        if part.get(
+            "functionCall"
+        ):
+
+            return True
+
+
+        text = part.get(
+            "text"
+        )
+
+
+        if (
+            isinstance(
+                text,
+                str
+            )
+            and
+            text != ""
+        ):
+
+            return True
+
+
+    return False
+
+
+def response_has_payload(
+    candidates: List[
+        Dict[str, Any]
+    ]
+) -> bool:
+
+    return any(
+        candidate_has_payload(
+            candidate
+        )
+        for candidate in candidates
+    )
+
+
+# =========================================================
+# GEMINI CANDIDATE → OPENAI
 # =========================================================
 
 def candidate_to_openai(
@@ -807,12 +748,16 @@ def candidate_to_openai(
 
             tool_calls.append(
                 {
+
                     "id":
                         (
                             function_call.get(
                                 "id"
                             )
-                            or (
+
+                            or
+
+                            (
                                 "call_"
                                 + str(
                                     int(
@@ -828,6 +773,7 @@ def candidate_to_openai(
 
                     "function":
                         {
+
                             "name":
                                 (
                                     function_call.get(
@@ -838,6 +784,7 @@ def candidate_to_openai(
 
                             "arguments":
                                 json.dumps(
+
                                     (
                                         function_call.get(
                                             "args"
@@ -882,14 +829,6 @@ def candidate_to_openai(
             )
 
 
-    # =====================================================
-    # CF Worker 使用：
-    #
-    # \n\n|>
-    #
-    # 拼接多个 part。
-    # =====================================================
-
     message[
         "content"
     ] = (
@@ -929,6 +868,7 @@ def candidate_to_openai(
 
         "finish_reason":
             (
+
                 "tool_calls"
 
                 if tool_calls
@@ -943,7 +883,7 @@ def candidate_to_openai(
 
 
 # =========================================================
-# TOKEN USAGE
+# USAGE
 # =========================================================
 
 def transform_usage(
@@ -1070,10 +1010,6 @@ async def root():
 
 # =========================================================
 # FAVICON
-#
-# 防止你之前日志一直出现：
-#
-# GET /favicon.ico 405
 # =========================================================
 
 @app.get("/favicon.ico")
@@ -1086,19 +1022,6 @@ async def favicon():
 
 # =========================================================
 # MODELS
-#
-# 同时支持：
-#
-# /models
-# /v1/models
-#
-# Chatbox API Host 如果填写：
-#
-# https://xxx.zeabur.app/v1
-#
-# 就会调用：
-#
-# /v1/models
 # =========================================================
 
 @app.get("/models")
@@ -1120,12 +1043,16 @@ async def models():
     )
 
 
-    for attempt, api_key in enumerate(
+    for (
+        attempt,
+        api_key
+    ) in enumerate(
         key_order,
         start=1
     ):
 
         try:
+
 
             url = (
                 f"{GEMINI_BASE_URL}/"
@@ -1193,26 +1120,23 @@ async def models():
                     )
 
 
-                if not name:
+                if name:
 
-                    continue
+                    result.append(
+                        {
+                            "id":
+                                name,
 
+                            "object":
+                                "model",
 
-                result.append(
-                    {
-                        "id":
-                            name,
+                            "created":
+                                0,
 
-                        "object":
-                            "model",
-
-                        "created":
-                            0,
-
-                        "owned_by":
-                            "google",
-                    }
-                )
+                            "owned_by":
+                                "google",
+                        }
+                    )
 
 
             return {
@@ -1227,6 +1151,7 @@ async def models():
 
         except Exception as exc:
 
+
             last_error = exc
 
 
@@ -1238,6 +1163,10 @@ async def models():
                 flush=True
             )
 
+
+            # =================================================
+            # 保持原来的重试流程
+            # =================================================
 
             if attempt < len(
                 key_order
@@ -1261,11 +1190,6 @@ async def models():
 
 # =========================================================
 # CHAT COMPLETIONS
-#
-# 同时支持：
-#
-# /chat/completions
-# /v1/chat/completions
 # =========================================================
 
 @app.post("/chat/completions")
@@ -1279,13 +1203,13 @@ async def chat_completions(
     # MODEL 完全透传
     # =====================================================
 
-    target_model = req.model
+    target_model = (
+        req.model
+    )
 
 
     # =====================================================
-    # 只有明确 stream=true 才走 SSE
-    #
-    # 这是之前最关键的兼容问题。
+    # STREAM
     # =====================================================
 
     is_stream = (
@@ -1294,16 +1218,18 @@ async def chat_completions(
 
 
     # =====================================================
-    # 构造 Gemini 请求
+    # GEMINI BODY
     # =====================================================
 
-    body = build_gemini_body(
-        req
+    body = (
+        build_gemini_body(
+            req
+        )
     )
 
 
     # =====================================================
-    # 取得本次请求的 Key 顺序
+    # KEY 顺序
     # =====================================================
 
     key_order = (
@@ -1316,11 +1242,26 @@ async def chat_completions(
     )
 
 
+    # =====================================================
+    # 每一个 Chatbox 请求都有新的 ID
+    #
+    # 你重新点重试时，
+    # 这里一定会生成一个新 ID。
+    # =====================================================
+
+    completion_id = (
+        make_completion_id()
+    )
+
+
     print(
+
         "[Chat Request] "
+        f"id={completion_id} "
         f"model={target_model} "
         f"stream_received={req.stream!r} "
         f"effective_stream={is_stream}",
+
         flush=True
     )
 
@@ -1335,26 +1276,21 @@ async def chat_completions(
         async def event_stream():
 
 
-            completion_id = (
-                make_completion_id()
-            )
-
-
             last_error: Optional[
                 Exception
             ] = None
 
 
             # =================================================
-            # 一旦已经给 Chatbox 发出内容，
-            # 就不能换 Key 从头生成。
+            # 一旦已经真正给 Chatbox 输出，
+            # 就不能切 Key 从头重生成。
             # =================================================
 
             sent_any_openai_chunk = False
 
 
             # =================================================
-            # KEY RETRY
+            # 保持你现有的多 Key / 繁忙重试流程
             # =================================================
 
             for (
@@ -1367,6 +1303,8 @@ async def chat_completions(
 
 
                 got_google_event = False
+
+                saw_payload = False
 
                 sent_first_chunk = False
 
@@ -1382,7 +1320,13 @@ async def chat_completions(
                 ] = None
 
 
+                last_google_chunk: Optional[
+                    Dict[str, Any]
+                ] = None
+
+
                 url = (
+
                     f"{GEMINI_BASE_URL}/"
                     f"{GEMINI_API_VERSION}/"
                     f"models/{target_model}:"
@@ -1395,10 +1339,13 @@ async def chat_completions(
 
 
                     print(
+
                         "[Gemini Stream Start] "
+                        f"id={completion_id} "
                         f"model={target_model} "
                         f"attempt={attempt}/"
                         f"{len(key_order)}",
+
                         flush=True
                     )
 
@@ -1407,8 +1354,6 @@ async def chat_completions(
 
                         connect=20.0,
 
-                        # 高思考模式可能较慢。
-                        # 不在这里强制截断生成。
                         read=None,
 
                         write=30.0,
@@ -1424,6 +1369,7 @@ async def chat_completions(
                         url,
 
                         headers={
+
                             "x-goog-api-key":
                                 api_key,
 
@@ -1442,16 +1388,18 @@ async def chat_completions(
 
 
                         print(
+
                             "[Gemini Stream HTTP] "
+                            f"id={completion_id} "
                             f"model={target_model} "
-                            f"status="
-                            f"{response.status_code}",
+                            f"status={response.status_code}",
+
                             flush=True
                         )
 
 
                         # =====================================
-                        # GOOGLE ERROR
+                        # HTTP ERROR
                         # =====================================
 
                         if not response.is_success:
@@ -1471,6 +1419,7 @@ async def chat_completions(
 
 
                             raise RuntimeError(
+
                                 "Gemini HTTP "
                                 f"{response.status_code}: "
                                 f"{error_text}"
@@ -1478,7 +1427,7 @@ async def chat_completions(
 
 
                         # =====================================
-                        # GOOGLE SSE
+                        # GEMINI SSE
                         # =====================================
 
                         async for line in (
@@ -1486,18 +1435,10 @@ async def chat_completions(
                         ):
 
 
-                            # =================================
-                            # 空行
-                            # =================================
-
                             if not line:
 
                                 continue
 
-
-                            # =================================
-                            # SSE comment
-                            # =================================
 
                             if line.startswith(
                                 ":"
@@ -1505,10 +1446,6 @@ async def chat_completions(
 
                                 continue
 
-
-                            # =================================
-                            # 只处理 data:
-                            # =================================
 
                             if not line.startswith(
                                 "data:"
@@ -1528,10 +1465,6 @@ async def chat_completions(
                                 continue
 
 
-                            # =================================
-                            # JSON
-                            # =================================
-
                             try:
 
                                 google_chunk = (
@@ -1543,33 +1476,27 @@ async def chat_completions(
                             except json.JSONDecodeError as exc:
 
                                 raise RuntimeError(
+
                                     "Gemini SSE JSON "
                                     "解析失败: "
                                     f"{raw[:500]}"
+
                                 ) from exc
 
 
-                            # =================================
-                            # CF Worker 会要求 candidates 存在
-                            # =================================
+                            got_google_event = True
+
+                            last_google_chunk = (
+                                google_chunk
+                            )
+
 
                             candidates = (
                                 google_chunk.get(
                                     "candidates"
                                 )
+                                or []
                             )
-
-
-                            if candidates is None:
-
-                                raise RuntimeError(
-                                    "Gemini 返回无 "
-                                    "candidates 的流事件: "
-                                    f"{raw[:500]}"
-                                )
-
-
-                            got_google_event = True
 
 
                             # =================================
@@ -1582,88 +1509,12 @@ async def chat_completions(
 
                                 final_usage = (
                                     transform_usage(
+
                                         google_chunk.get(
                                             "usageMetadata"
                                         )
                                     )
                                 )
-
-
-                            # =================================
-                            # 第一帧
-                            #
-                            # 完全按照你的 CF Worker：
-                            #
-                            # delta:
-                            # {
-                            #   role: assistant,
-                            #   content: ""
-                            # }
-                            # =================================
-
-                            if (
-                                candidates
-                                and
-                                not sent_first_chunk
-                            ):
-
-
-                                first_choice = (
-                                    candidate_to_openai(
-                                        candidates[0],
-                                        "delta"
-                                    )
-                                )
-
-
-                                first_choice[
-                                    "delta"
-                                ] = {
-
-                                    "role":
-                                        "assistant",
-
-                                    "content":
-                                        "",
-                                }
-
-
-                                first_choice[
-                                    "finish_reason"
-                                ] = None
-
-
-                                first_payload = {
-
-                                    "id":
-                                        completion_id,
-
-                                    "choices":
-                                        [
-                                            first_choice
-                                        ],
-
-                                    "created":
-                                        int(
-                                            time.time()
-                                        ),
-
-                                    "model":
-                                        target_model,
-
-                                    "object":
-                                        "chat.completion.chunk",
-                                }
-
-
-                                yield sse(
-                                    first_payload
-                                )
-
-
-                                sent_first_chunk = True
-
-                                sent_any_openai_chunk = True
 
 
                             # =================================
@@ -1673,24 +1524,147 @@ async def chat_completions(
                             for candidate in candidates:
 
 
+                                index = (
+                                    candidate.get(
+                                        "index"
+                                    )
+                                    or 0
+                                )
+
+
+                                finish_reason = (
+                                    map_finish_reason(
+
+                                        candidate.get(
+                                            "finishReason"
+                                        )
+                                    )
+                                )
+
+
+                                # =================================
+                                # 即使这一帧没有正文，
+                                # 仍然保存最后 finish reason
+                                # =================================
+
+                                if finish_reason is not None:
+
+                                    final_choices[
+                                        index
+                                    ] = {
+
+                                        "index":
+                                            index,
+
+                                        "delta":
+                                            {},
+
+                                        "logprobs":
+                                            None,
+
+                                        "finish_reason":
+                                            finish_reason,
+                                    }
+
+
+                                # =================================
+                                # 关键：
+                                #
+                                # candidate 存在但没正文，
+                                # 不算成功。
+                                # =================================
+
+                                if not candidate_has_payload(
+                                    candidate
+                                ):
+
+                                    continue
+
+
+                                saw_payload = True
+
+
+                                # =================================
+                                # 第一个真正有内容的 candidate
+                                # 才给 Chatbox 发送第一帧。
+                                #
+                                # 这样空回复仍然可以安全重试。
+                                # =================================
+
+                                if not sent_first_chunk:
+
+
+                                    first_payload = {
+
+                                        "id":
+                                            completion_id,
+
+                                        "choices":
+                                            [
+                                                {
+                                                    "index":
+                                                        0,
+
+                                                    "delta":
+                                                        {
+                                                            "role":
+                                                                "assistant",
+
+                                                            "content":
+                                                                "",
+                                                        },
+
+                                                    "logprobs":
+                                                        None,
+
+                                                    "finish_reason":
+                                                        None,
+                                                }
+                                            ],
+
+                                        "created":
+                                            int(
+                                                time.time()
+                                            ),
+
+                                        "model":
+                                            target_model,
+
+                                        "object":
+                                            "chat.completion.chunk",
+                                    }
+
+
+                                    yield sse(
+                                        first_payload
+                                    )
+
+
+                                    sent_first_chunk = True
+
+                                    sent_any_openai_chunk = True
+
+
+                                # =================================
+                                # 正文
+                                # =================================
+
                                 choice = (
                                     candidate_to_openai(
+
                                         candidate,
+
                                         "delta"
                                     )
                                 )
 
 
-                                finish_reason = (
+                                choice_finish_reason = (
                                     choice.get(
                                         "finish_reason"
                                     )
                                 )
 
-
-                                # =================================
-                                # 正文 chunk 不立即带结束状态
-                                # =================================
 
                                 choice[
                                     "finish_reason"
@@ -1705,9 +1679,6 @@ async def chat_completions(
                                 )
 
 
-                                # 第一帧后，
-                                # 后续不再重复 role
-
                                 delta.pop(
                                     "role",
                                     None
@@ -1715,15 +1686,21 @@ async def chat_completions(
 
 
                                 # =================================
-                                # 与 CF Worker 一致：
-                                #
-                                # 只要 delta 有 content 字段
-                                # 就发送。
+                                # 只发送真正有内容的 chunk
                                 # =================================
 
                                 if (
-                                    "content"
-                                    in delta
+
+                                    delta.get(
+                                        "content"
+                                    )
+                                    is not None
+
+                                    or
+
+                                    delta.get(
+                                        "tool_calls"
+                                    )
                                 ):
 
 
@@ -1758,17 +1735,12 @@ async def chat_completions(
                                     sent_any_openai_chunk = True
 
 
-                                # =================================
-                                # 暂存最终状态
-                                # =================================
-
-                                final_choice = {
+                                final_choices[
+                                    index
+                                ] = {
 
                                     "index":
-                                        choice.get(
-                                            "index",
-                                            0
-                                        ),
+                                        index,
 
                                     "delta":
                                         {},
@@ -1777,193 +1749,116 @@ async def chat_completions(
                                         None,
 
                                     "finish_reason":
-                                        finish_reason,
+                                        choice_finish_reason,
                                 }
 
 
-                                final_choices[
-                                    final_choice[
-                                        "index"
-                                    ]
-                                ] = final_choice
-
-
                     # =================================================
-                    # GOOGLE STREAM 正常关闭
+                    # 关键修改：
+                    #
+                    # Gemini HTTP 200
+                    # SSE 也正常结束
+                    #
+                    # 但如果从头到尾没有任何真正正文，
+                    # 不能返回空成功。
+                    #
+                    # 抛异常，让它进入下面原有重试流程。
                     # =================================================
 
-                    if got_google_event:
+                    if not saw_payload:
 
 
-                        # =============================================
-                        # 极端情况下 Google 有事件
-                        # 但没有 candidate 正文
-                        # =============================================
+                        raw_debug = (
 
-                        if not sent_first_chunk:
-
-
-                            first_payload = {
-
-                                "id":
-                                    completion_id,
-
-                                "choices":
-                                    [
-                                        {
-                                            "index":
-                                                0,
-
-                                            "delta":
-                                                {
-                                                    "role":
-                                                        "assistant",
-
-                                                    "content":
-                                                        "",
-                                                },
-
-                                            "logprobs":
-                                                None,
-
-                                            "finish_reason":
-                                                None,
-                                        }
-                                    ],
-
-                                "created":
-                                    int(
-                                        time.time()
-                                    ),
-
-                                "model":
-                                    target_model,
-
-                                "object":
-                                    "chat.completion.chunk",
-                            }
-
-
-                            yield sse(
-                                first_payload
+                            json.dumps(
+                                last_google_chunk,
+                                ensure_ascii=False
                             )
 
+                            if last_google_chunk
 
-                            sent_any_openai_chunk = True
-
-
-                        # =============================================
-                        # stream_options.include_usage
-                        # =============================================
-
-                        include_usage = bool(
-
-                            req.stream_options
-
-                            and
-
-                            req.stream_options.get(
-                                "include_usage"
-                            )
+                            else "null"
                         )
 
 
-                        # =============================================
-                        # FINAL CHUNK
-                        # =============================================
+                        print(
 
-                        if final_choices:
+                            "[Gemini Empty Stream] "
+                            f"id={completion_id} "
+                            f"model={target_model} "
+                            f"attempt={attempt}/"
+                            f"{len(key_order)} "
+                            f"raw={raw_debug}",
+
+                            flush=True
+                        )
 
 
-                            for index in sorted(
-                                final_choices
+                        raise RuntimeError(
+
+                            "Gemini HTTP 200 / SSE 正常结束，"
+                            "但没有返回任何可用正文或工具调用"
+                        )
+
+
+                    # =================================================
+                    # INCLUDE USAGE
+                    # =================================================
+
+                    include_usage = bool(
+
+                        req.stream_options
+
+                        and
+
+                        req.stream_options.get(
+                            "include_usage"
+                        )
+                    )
+
+
+                    # =================================================
+                    # FINAL
+                    # =================================================
+
+                    if final_choices:
+
+
+                        for index in sorted(
+                            final_choices
+                        ):
+
+
+                            final_choice = (
+                                final_choices[
+                                    index
+                                ]
+                            )
+
+
+                            if (
+                                final_choice[
+                                    "finish_reason"
+                                ]
+                                is None
                             ):
 
-
-                                final_choice = (
-                                    final_choices[
-                                        index
-                                    ]
-                                )
+                                final_choice[
+                                    "finish_reason"
+                                ] = "stop"
 
 
-                                if (
-                                    final_choice[
-                                        "finish_reason"
-                                    ]
-                                    is None
-                                ):
-
-                                    final_choice[
-                                        "finish_reason"
-                                    ] = "stop"
-
-
-                                final_payload: Dict[
-                                    str,
-                                    Any
-                                ] = {
-
-                                    "id":
-                                        completion_id,
-
-                                    "choices":
-                                        [
-                                            final_choice
-                                        ],
-
-                                    "created":
-                                        int(
-                                            time.time()
-                                        ),
-
-                                    "model":
-                                        target_model,
-
-                                    "object":
-                                        "chat.completion.chunk",
-                                }
-
-
-                                if (
-                                    include_usage
-                                    and
-                                    final_usage
-                                ):
-
-                                    final_payload[
-                                        "usage"
-                                    ] = final_usage
-
-
-                                yield sse(
-                                    final_payload
-                                )
-
-
-                        else:
-
-
-                            final_payload = {
+                            final_payload: Dict[
+                                str,
+                                Any
+                            ] = {
 
                                 "id":
                                     completion_id,
 
                                 "choices":
                                     [
-                                        {
-                                            "index":
-                                                0,
-
-                                            "delta":
-                                                {},
-
-                                            "logprobs":
-                                                None,
-
-                                            "finish_reason":
-                                                "stop",
-                                        }
+                                        final_choice
                                     ],
 
                                 "created":
@@ -1995,37 +1890,80 @@ async def chat_completions(
                             )
 
 
-                        # =============================================
-                        # DONE
-                        # =============================================
+                    else:
 
-                        yield (
-                            "data: [DONE]\n\n"
+
+                        final_payload = {
+
+                            "id":
+                                completion_id,
+
+                            "choices":
+                                [
+                                    {
+                                        "index":
+                                            0,
+
+                                        "delta":
+                                            {},
+
+                                        "logprobs":
+                                            None,
+
+                                        "finish_reason":
+                                            "stop",
+                                    }
+                                ],
+
+                            "created":
+                                int(
+                                    time.time()
+                                ),
+
+                            "model":
+                                target_model,
+
+                            "object":
+                                "chat.completion.chunk",
+                        }
+
+
+                        if (
+                            include_usage
+                            and
+                            final_usage
+                        ):
+
+                            final_payload[
+                                "usage"
+                            ] = final_usage
+
+
+                        yield sse(
+                            final_payload
                         )
 
 
-                        print(
-                            "[Gemini Stream Done] "
-                            f"model={target_model}",
-                            flush=True
-                        )
-
-
-                        return
-
-
-                    # =================================================
-                    # HTTP 200 但 Gemini 一个事件都没给
-                    # =================================================
-
-                    raise RuntimeError(
-                        "Gemini SSE 已关闭，"
-                        "但没有返回任何事件"
+                    yield (
+                        "data: [DONE]\n\n"
                     )
 
 
+                    print(
+
+                        "[Gemini Stream Done] "
+                        f"id={completion_id} "
+                        f"model={target_model}",
+
+                        flush=True
+                    )
+
+
+                    return
+
+
                 # =====================================================
-                # STREAM ERROR
+                # ERROR / EMPTY RESPONSE
                 # =====================================================
 
                 except Exception as exc:
@@ -2035,30 +1973,35 @@ async def chat_completions(
 
 
                     print(
+
                         "[Gemini Stream Error] "
+                        f"id={completion_id} "
                         f"model={target_model} "
                         f"attempt={attempt}/"
                         f"{len(key_order)} "
                         f"error={exc!r}",
+
                         flush=True
                     )
 
 
-                    # ================================================
-                    # 一个 Google 事件都没收到，
-                    # 并且还没有向 Chatbox 输出任何 chunk：
+                    # =================================================
+                    # 保持你的原有繁忙/多 Key 重试流程
                     #
-                    # 可以安全换下一个 Key。
-                    # ================================================
+                    # 还没有给 Chatbox 输出任何内容：
+                    #
+                    # 等 0.4 秒
+                    # → 换下一个 Key
+                    #
+                    # 这里没有修改。
+                    # =================================================
 
                     if (
 
                         not sent_any_openai_chunk
 
                         and
-                        not got_google_event
 
-                        and
                         attempt < len(
                             key_order
                         )
@@ -2073,19 +2016,19 @@ async def chat_completions(
                         continue
 
 
-                    # ================================================
-                    # 已经开始输出以后不能换 Key，
-                    # 否则会从头重复回答。
-                    # ================================================
+                    # =================================================
+                    # 已经输出过正文：
+                    #
+                    # 不切 Key。
+                    # =================================================
 
                     break
 
 
             # =========================================================
-            # ALL KEYS FAILED
+            # 所有 Key 都失败
             #
-            # StreamingResponse 一旦建立以后 HTTP 已经是 200，
-            # 此时只能正常结束 SSE。
+            # 绝不再空白结束。
             # =========================================================
 
             if not sent_any_openai_chunk:
@@ -2093,6 +2036,7 @@ async def chat_completions(
 
                 yield sse(
                     {
+
                         "id":
                             completion_id,
 
@@ -2139,6 +2083,7 @@ async def chat_completions(
 
             yield sse(
                 {
+
                     "id":
                         completion_id,
 
@@ -2185,6 +2130,7 @@ async def chat_completions(
 
             yield sse(
                 {
+
                     "id":
                         completion_id,
 
@@ -2224,10 +2170,6 @@ async def chat_completions(
             )
 
 
-        # =============================================================
-        # RETURN SSE
-        # =============================================================
-
         return StreamingResponse(
 
             event_stream(),
@@ -2251,18 +2193,16 @@ async def chat_completions(
 
     # =========================================================
     # NON STREAM
-    #
-    # stream=false
-    #
-    # 或者 Chatbox 根本没有发送 stream
-    #
-    # 都必须返回 JSON。
     # =========================================================
 
     last_error: Optional[
         Exception
     ] = None
 
+
+    # =========================================================
+    # 保持原来的多 Key / 繁忙重试流程
+    # =========================================================
 
     for (
         attempt,
@@ -2277,6 +2217,7 @@ async def chat_completions(
 
 
             url = (
+
                 f"{GEMINI_BASE_URL}/"
                 f"{GEMINI_API_VERSION}/"
                 f"models/{target_model}:"
@@ -2285,10 +2226,13 @@ async def chat_completions(
 
 
             print(
+
                 "[Gemini Generate Start] "
+                f"id={completion_id} "
                 f"model={target_model} "
                 f"attempt={attempt}/"
                 f"{len(key_order)}",
+
                 flush=True
             )
 
@@ -2299,6 +2243,7 @@ async def chat_completions(
                     url,
 
                     headers={
+
                         "x-goog-api-key":
                             api_key,
 
@@ -2316,21 +2261,24 @@ async def chat_completions(
 
 
             print(
+
                 "[Gemini Generate HTTP] "
+                f"id={completion_id} "
                 f"model={target_model} "
-                f"status="
-                f"{response.status_code}",
+                f"status={response.status_code}",
+
                 flush=True
             )
 
 
             # =================================================
-            # GOOGLE ERROR
+            # HTTP ERROR
             # =================================================
 
             if not response.is_success:
 
                 raise RuntimeError(
+
                     "Gemini HTTP "
                     f"{response.status_code}: "
                     f"{response.text}"
@@ -2351,7 +2299,65 @@ async def chat_completions(
 
 
             # =================================================
-            # OPENAI CHOICES
+            # 关键修改：
+            #
+            # HTTP 200 但：
+            #
+            # candidates=[]
+            #
+            # 或者 candidates 有对象，
+            # 但没有任何正文 / tool call。
+            #
+            # 以前：
+            # 返回空 assistant → Chatbox 0 秒空回。
+            #
+            # 现在：
+            # 当作本次请求失败
+            # → 进入原来的多 Key 重试流程。
+            # =================================================
+
+            if (
+
+                not candidates
+
+                or
+
+                not response_has_payload(
+                    candidates
+                )
+            ):
+
+
+                raw_debug = (
+                    json.dumps(
+                        google_data,
+                        ensure_ascii=False
+                    )
+                )
+
+
+                print(
+
+                    "[Gemini Empty Response] "
+                    f"id={completion_id} "
+                    f"model={target_model} "
+                    f"attempt={attempt}/"
+                    f"{len(key_order)} "
+                    f"raw={raw_debug}",
+
+                    flush=True
+                )
+
+
+                raise RuntimeError(
+
+                    "Gemini HTTP 200，"
+                    "但没有返回任何可用正文或工具调用"
+                )
+
+
+            # =================================================
+            # NORMAL RESPONSE
             # =================================================
 
             choices = [
@@ -2366,60 +2372,13 @@ async def chat_completions(
             ]
 
 
-            # =================================================
-            # 没有 candidate
-            # =================================================
-
-            if not choices:
-
-
-                block_reason = (
-                    (
-                        google_data.get(
-                            "promptFeedback"
-                        )
-                        or {}
-                    )
-                    .get(
-                        "blockReason"
-                    )
-                )
-
-
-                choices = [
-                    {
-                        "index":
-                            0,
-
-                        "message":
-                            None,
-
-                        "logprobs":
-                            None,
-
-                        "finish_reason":
-                            (
-                                "content_filter"
-
-                                if block_reason
-
-                                else "stop"
-                            ),
-                    }
-                ]
-
-
-            # =================================================
-            # OPENAI RESPONSE
-            # =================================================
-
             result: Dict[
                 str,
                 Any
             ] = {
 
                 "id":
-                    make_completion_id(),
+                    completion_id,
 
                 "choices":
                     choices,
@@ -2443,6 +2402,7 @@ async def chat_completions(
 
             usage = (
                 transform_usage(
+
                     google_data.get(
                         "usageMetadata"
                     )
@@ -2458,8 +2418,11 @@ async def chat_completions(
 
 
             print(
+
                 "[Gemini Generate Done] "
+                f"id={completion_id} "
                 f"model={target_model}",
+
                 flush=True
             )
 
@@ -2470,7 +2433,7 @@ async def chat_completions(
 
 
         # =====================================================
-        # NON STREAM ERROR
+        # ERROR / EMPTY RESPONSE
         # =====================================================
 
         except Exception as exc:
@@ -2480,17 +2443,24 @@ async def chat_completions(
 
 
             print(
+
                 "[Gemini Generate Error] "
+                f"id={completion_id} "
                 f"model={target_model} "
                 f"attempt={attempt}/"
                 f"{len(key_order)} "
                 f"error={exc!r}",
+
                 flush=True
             )
 
 
             # =================================================
-            # 自动换下一个 Key
+            # 不改你的重试流程：
+            #
+            # 失败
+            # → 0.4 秒
+            # → 下一 Key
             # =================================================
 
             if attempt < len(
@@ -2503,7 +2473,9 @@ async def chat_completions(
 
 
     # =========================================================
-    # 所有 Key 都失败
+    # 所有 Key 全部失败
+    #
+    # 不再返回成功空消息。
     # =========================================================
 
     raise HTTPException(
@@ -2527,9 +2499,7 @@ async def chat_completions(
 
 
 # =========================================================
-# START SERVER
-#
-# Zeabur 会读取 PORT 环境变量。
+# START
 # =========================================================
 
 if __name__ == "__main__":
