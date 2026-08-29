@@ -3,24 +3,51 @@ import time
 import json
 import itertools
 import asyncio
-
-from fastapi import FastAPI, HTTPException
-from fastapi.responses import StreamingResponse
-from pydantic import BaseModel
 from typing import List, Optional, Any
+
+from fastapi import FastAPI, HTTPException, Request
+from fastapi.responses import StreamingResponse, JSONResponse, Response
+from fastapi.middleware.cors import CORSMiddleware
+from pydantic import BaseModel, ConfigDict
 
 from google import genai
 from google.genai import types
 
 
-app = FastAPI(title="Gemini OpenAI Compatible Router")
+# =========================================================
+# APP
+# =========================================================
+
+app = FastAPI(
+    title="Gemini OpenAI Compatible Router"
+)
+
+
+# =========================================================
+# CORS
+#
+# 对齐你 Cloudflare Worker 的行为。
+# 手机端 Chatbox / WebView 需要这个。
+# =========================================================
+
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_credentials=False,
+    allow_methods=["*"],
+    allow_headers=["*"],
+    expose_headers=["*"],
+)
 
 
 # =========================================================
 # API KEYS
 # =========================================================
 
-keys_env = os.environ.get("GEMINI_API_KEYS", "")
+keys_env = os.environ.get(
+    "GEMINI_API_KEYS",
+    ""
+)
 
 API_KEYS = [
     key.strip()
@@ -45,6 +72,7 @@ client_cycle = (
 def get_next_client():
 
     if not client_cycle:
+
         raise HTTPException(
             status_code=500,
             detail="请在环境变量中设置 GEMINI_API_KEYS"
@@ -55,6 +83,8 @@ def get_next_client():
 
 # =========================================================
 # SAFETY
+#
+# 与你原 Cloudflare Worker 的 BLOCK_NONE 行为保持一致
 # =========================================================
 
 GLOBAL_SAFETY_SETTINGS = [
@@ -82,20 +112,41 @@ GLOBAL_SAFETY_SETTINGS = [
 
 
 # =========================================================
-# OPENAI REQUEST STRUCTURE
+# OPENAI REQUEST MODELS
 # =========================================================
 
 class ChatMessage(BaseModel):
+
+    model_config = ConfigDict(
+        extra="allow"
+    )
+
     role: str
-    content: Any
+
+    content: Any = None
+
+    name: Optional[str] = None
+
+    tool_call_id: Optional[str] = None
+
+    tool_calls: Optional[List[Any]] = None
 
 
 class ChatRequest(BaseModel):
 
+    model_config = ConfigDict(
+        extra="allow"
+    )
+
     # =====================================================
-    # 完全透传
+    # MODEL 必填
     #
-    # Chatbox 写什么，这里就是什么
+    # Chatbox 传什么，就原样使用什么。
+    #
+    # 不映射
+    # 不替换
+    # 不白名单
+    # 不 DEFAULT_MODEL
     # =====================================================
 
     model: str
@@ -104,70 +155,417 @@ class ChatRequest(BaseModel):
 
     stream: Optional[bool] = True
 
-    # 默认最高思考
+
+    # =====================================================
+    # 默认 HIGH
+    # =====================================================
+
     thinking_level: Optional[str] = "high"
 
-    # Chatbox 可能会传这些 OpenAI 参数
-    # 暂时接收，但不强制使用
+
+    # =====================================================
+    # OpenAI 常见参数
+    # =====================================================
+
     temperature: Optional[float] = None
+
     top_p: Optional[float] = None
+
+    top_k: Optional[int] = None
+
     max_tokens: Optional[int] = None
+
     max_completion_tokens: Optional[int] = None
 
+    stop: Optional[Any] = None
+
+    seed: Optional[int] = None
+
+    presence_penalty: Optional[float] = None
+
+    frequency_penalty: Optional[float] = None
+
+    n: Optional[int] = None
+
 
 # =========================================================
-# CONFIG
+# MESSAGE CONTENT
 # =========================================================
 
-def build_config(req: ChatRequest):
+def extract_text_content(content: Any) -> str:
 
-    thinking_level = req.thinking_level
+    if content is None:
+        return ""
+
+    if isinstance(content, str):
+        return content
+
+    if isinstance(content, list):
+
+        text_parts = []
+
+        for item in content:
+
+            if not isinstance(item, dict):
+                continue
+
+            item_type = item.get("type")
+
+
+            # OpenAI text
+            if item_type == "text":
+
+                text_parts.append(
+                    str(
+                        item.get(
+                            "text",
+                            ""
+                        )
+                    )
+                )
+
+
+            # 某些客户端可能使用 input_text
+            elif item_type == "input_text":
+
+                text_parts.append(
+                    str(
+                        item.get(
+                            "text",
+                            ""
+                        )
+                    )
+                )
+
+
+        return "\n".join(
+            text_parts
+        )
+
+    return str(content)
+
+
+# =========================================================
+# OPENAI MESSAGES → GEMINI
+#
+# 对齐你的 CF Worker：
+#
+# system    → system_instruction
+# user      → user
+# assistant → model
+#
+# =========================================================
+
+def transform_messages(
+    messages: List[ChatMessage]
+):
+
+    system_parts = []
+
+    contents = []
+
+
+    for msg in messages:
+
+        role = msg.role
+
+        text = extract_text_content(
+            msg.content
+        )
+
+
+        # =================================================
+        # SYSTEM
+        # =================================================
+
+        if role in (
+            "system",
+            "developer",
+        ):
+
+            if text:
+
+                system_parts.append(
+                    text
+                )
+
+            continue
+
+
+        # =================================================
+        # USER
+        # =================================================
+
+        if role == "user":
+
+            contents.append(
+                types.Content(
+                    role="user",
+                    parts=[
+                        types.Part(
+                            text=text
+                        )
+                    ]
+                )
+            )
+
+            continue
+
+
+        # =================================================
+        # ASSISTANT
+        # =================================================
+
+        if role == "assistant":
+
+            contents.append(
+                types.Content(
+                    role="model",
+                    parts=[
+                        types.Part(
+                            text=text
+                        )
+                    ]
+                )
+            )
+
+            continue
+
+
+        # =================================================
+        # TOOL
+        #
+        # 当前先作为文本继续传递，
+        # 避免直接让整个请求 422。
+        # =================================================
+
+        if role == "tool":
+
+            contents.append(
+                types.Content(
+                    role="user",
+                    parts=[
+                        types.Part(
+                            text=text
+                        )
+                    ]
+                )
+            )
+
+            continue
+
+
+        # =================================================
+        # UNKNOWN ROLE
+        # =================================================
+
+        contents.append(
+            types.Content(
+                role="user",
+                parts=[
+                    types.Part(
+                        text=text
+                    )
+                ]
+            )
+        )
+
+
+    system_instruction = None
+
+
+    if system_parts:
+
+        system_instruction = types.Content(
+            role="user",
+            parts=[
+                types.Part(
+                    text="\n\n".join(
+                        system_parts
+                    )
+                )
+            ]
+        )
+
+
+    # Gemini 某些情况下不能只有 system_instruction
+    if not contents:
+
+        contents.append(
+            types.Content(
+                role="user",
+                parts=[
+                    types.Part(
+                        text=" "
+                    )
+                ]
+            )
+        )
+
+
+    return (
+        system_instruction,
+        contents,
+    )
+
+
+# =========================================================
+# GENERATION CONFIG
+# =========================================================
+
+def build_config(
+    req: ChatRequest,
+    system_instruction=None,
+):
+
+    # =====================================================
+    # THINKING
+    # =====================================================
+
+    thinking_level = (
+        req.thinking_level
+        or "high"
+    )
+
 
     if thinking_level not in (
         "low",
         "medium",
         "high",
-        None,
     ):
+
         thinking_level = "high"
 
 
-    thinking_config = None
+    thinking_config = types.ThinkingConfig(
+        thinking_level=thinking_level
+    )
 
-    if thinking_level:
 
-        thinking_config = types.ThinkingConfig(
-            thinking_level=thinking_level
-        )
-
+    # =====================================================
+    # CONFIG
+    # =====================================================
 
     config_args = {
-        "safety_settings": GLOBAL_SAFETY_SETTINGS,
-        "thinking_config": thinking_config,
+
+        "safety_settings":
+            GLOBAL_SAFETY_SETTINGS,
+
+        "thinking_config":
+            thinking_config,
     }
 
 
     # =====================================================
-    # 兼容 Chatbox 传来的生成参数
+    # SYSTEM
+    # =====================================================
+
+    if system_instruction is not None:
+
+        config_args[
+            "system_instruction"
+        ] = system_instruction
+
+
+    # =====================================================
+    # TEMPERATURE
     # =====================================================
 
     if req.temperature is not None:
-        config_args["temperature"] = req.temperature
+
+        config_args[
+            "temperature"
+        ] = req.temperature
+
+
+    # =====================================================
+    # TOP P
+    # =====================================================
 
     if req.top_p is not None:
-        config_args["top_p"] = req.top_p
+
+        config_args[
+            "top_p"
+        ] = req.top_p
 
 
-    # OpenAI 新旧参数都兼容
+    # =====================================================
+    # TOP K
+    # =====================================================
 
-    max_tokens = (
+    if req.top_k is not None:
+
+        config_args[
+            "top_k"
+        ] = req.top_k
+
+
+    # =====================================================
+    # MAX TOKENS
+    # =====================================================
+
+    max_tokens = None
+
+
+    if (
         req.max_completion_tokens
-        if req.max_completion_tokens is not None
-        else req.max_tokens
-    )
+        is not None
+    ):
+
+        max_tokens = (
+            req.max_completion_tokens
+        )
+
+    elif req.max_tokens is not None:
+
+        max_tokens = (
+            req.max_tokens
+        )
+
 
     if max_tokens is not None:
-        config_args["max_output_tokens"] = max_tokens
+
+        config_args[
+            "max_output_tokens"
+        ] = max_tokens
+
+
+    # =====================================================
+    # STOP
+    # =====================================================
+
+    if req.stop is not None:
+
+        if isinstance(
+            req.stop,
+            str
+        ):
+
+            config_args[
+                "stop_sequences"
+            ] = [
+                req.stop
+            ]
+
+        elif isinstance(
+            req.stop,
+            list
+        ):
+
+            config_args[
+                "stop_sequences"
+            ] = req.stop
+
+
+    # =====================================================
+    # SEED
+    # =====================================================
+
+    if req.seed is not None:
+
+        config_args[
+            "seed"
+        ] = req.seed
 
 
     return types.GenerateContentConfig(
@@ -176,53 +574,38 @@ def build_config(req: ChatRequest):
 
 
 # =========================================================
-# MESSAGE → PROMPT
+# OPENAI IDS
 # =========================================================
 
-def build_prompt(messages: List[ChatMessage]):
+def make_completion_id():
 
-    parts = []
-
-    for msg in messages:
-
-        content = msg.content
-
-
-        # 普通文本
-        if isinstance(content, str):
-
-            text = content
-
-
-        # OpenAI content array
-        elif isinstance(content, list):
-
-            text_parts = []
-
-            for item in content:
-
-                if not isinstance(item, dict):
-                    continue
-
-                if item.get("type") == "text":
-                    text_parts.append(
-                        str(item.get("text", ""))
-                    )
-
-            text = "\n".join(text_parts)
-
-
-        else:
-
-            text = str(content)
-
-
-        parts.append(
-            f"{msg.role}: {text}"
+    return (
+        "chatcmpl-gemini-"
+        + str(
+            int(
+                time.time() * 1000
+            )
         )
+    )
 
 
-    return "\n".join(parts)
+# =========================================================
+# SSE HELPER
+# =========================================================
+
+def make_sse(
+    payload: dict
+):
+
+    return (
+        "data: "
+        + json.dumps(
+            payload,
+            ensure_ascii=False,
+            separators=(",", ":"),
+        )
+        + "\n\n"
+    )
 
 
 # =========================================================
@@ -233,110 +616,256 @@ def build_prompt(messages: List[ChatMessage]):
 async def root():
 
     return {
-        "status": "running",
-        "service": "Gemini OpenAI Compatible Router",
-        "loaded_keys_count": len(CLIENT_POOL),
-        "model_mode": "passthrough",
-        "default_thinking_level": "high",
+
+        "status":
+            "running",
+
+        "service":
+            "Gemini OpenAI Compatible Router",
+
+        "loaded_keys_count":
+            len(CLIENT_POOL),
+
+        "model_mode":
+            "passthrough",
+
+        "default_thinking_level":
+            "high",
     }
+
+
+# =========================================================
+# OPTIONS
+#
+# FastAPI CORS middleware 已经会处理，
+# 这里额外留一个兜底。
+# =========================================================
+
+@app.options("/{path:path}")
+async def options_handler(
+    path: str
+):
+
+    return Response(
+        status_code=204,
+        headers={
+            "Access-Control-Allow-Origin":
+                "*",
+
+            "Access-Control-Allow-Methods":
+                "*",
+
+            "Access-Control-Allow-Headers":
+                "*",
+        }
+    )
 
 
 # =========================================================
 # MODELS
 #
-# 同时兼容：
+# 同时支持：
 #
 # /models
 # /v1/models
 #
-# Chatbox 有时会请求 /models
+# 从 Google Gemini 获取真实列表。
 # =========================================================
 
 @app.get("/models")
 @app.get("/v1/models")
 async def models():
 
-    now = int(time.time())
+    if not CLIENT_POOL:
 
-    return {
-        "object": "list",
+        raise HTTPException(
+            status_code=500,
+            detail="未配置 GEMINI_API_KEYS"
+        )
 
-        # 不对白名单做限制
-        #
-        # 这里返回一个占位 Gemini 模型，
-        # 只是让 Chatbox 的模型接口检查通过。
-        #
-        # 实际聊天时 model 仍然完全透传。
-        "data": [
-            {
-                "id": "gemini",
-                "object": "model",
-                "created": now,
-                "owned_by": "google",
+
+    last_error = None
+
+    retry_count = len(
+        CLIENT_POOL
+    )
+
+
+    for attempt in range(
+        retry_count
+    ):
+
+        current_client = (
+            get_next_client()
+        )
+
+
+        try:
+
+            model_items = []
+
+
+            pager = (
+                await current_client.aio.models.list()
+            )
+
+
+            async for model in pager:
+
+                model_name = getattr(
+                    model,
+                    "name",
+                    None
+                )
+
+
+                if not model_name:
+                    continue
+
+
+                if model_name.startswith(
+                    "models/"
+                ):
+
+                    model_name = (
+                        model_name[7:]
+                    )
+
+
+                model_items.append(
+                    {
+                        "id":
+                            model_name,
+
+                        "object":
+                            "model",
+
+                        "created":
+                            0,
+
+                        "owned_by":
+                            "google",
+                    }
+                )
+
+
+            return {
+                "object":
+                    "list",
+
+                "data":
+                    model_items,
             }
-        ],
-    }
+
+
+        except Exception as e:
+
+            last_error = e
+
+
+            print(
+                "[Gemini Models Error] "
+                f"attempt={attempt + 1}/{retry_count} "
+                f"error_type={type(e).__name__} "
+                f"error={repr(e)}"
+            )
+
+
+            if (
+                attempt
+                < retry_count - 1
+            ):
+
+                await asyncio.sleep(
+                    0.5
+                )
+
+
+    raise HTTPException(
+        status_code=503,
+        detail={
+            "message":
+                "Gemini 模型列表请求失败",
+
+            "error":
+                str(last_error),
+        },
+    )
 
 
 # =========================================================
-# CHAT
+# CHAT COMPLETIONS
 #
-# 同时兼容：
+# 同时支持：
 #
 # /chat/completions
 # /v1/chat/completions
+#
 # =========================================================
 
 @app.post("/chat/completions")
 @app.post("/v1/chat/completions")
-async def chat_completions(req: ChatRequest):
+async def chat_completions(
+    req: ChatRequest
+):
 
 
     # =====================================================
-    # API KEY 检查
+    # KEY CHECK
     # =====================================================
 
     if not CLIENT_POOL:
 
         raise HTTPException(
             status_code=500,
-            detail="未配置 GEMINI_API_KEYS",
+            detail="未配置 GEMINI_API_KEYS"
         )
 
 
     # =====================================================
     # MODEL 完全透传
-    # =====================================================
     #
-    # 没有：
-    #
-    # DEFAULT_MODEL
-    # model mapping
-    # model whitelist
-    # model replacement
+    # 这是最重要的要求：
     #
     # Chatbox:
-    #
     # gemini-3.6-flash
     #
-    # Gemini SDK:
+    # ↓
     #
+    # Gemini SDK:
     # model="gemini-3.6-flash"
     #
+    # 不进行任何模型名转换。
     # =====================================================
 
     target_model = req.model
 
 
-    prompt_text = build_prompt(
+    # =====================================================
+    # MESSAGES
+    # =====================================================
+
+    (
+        system_instruction,
+        contents,
+    ) = transform_messages(
         req.messages
     )
 
 
-    config = build_config(req)
+    # =====================================================
+    # CONFIG
+    # =====================================================
+
+    config = build_config(
+        req,
+        system_instruction,
+    )
 
 
-    retry_count = len(CLIENT_POOL)
+    retry_count = len(
+        CLIENT_POOL
+    )
 
 
     # =====================================================
@@ -348,68 +877,47 @@ async def chat_completions(req: ChatRequest):
 
         async def event_stream():
 
+
+            completion_id = (
+                make_completion_id()
+            )
+
+
+            created = int(
+                time.time()
+            )
+
+
             last_error = None
 
 
-            completion_id = (
-                "chatcmpl-gemini-"
-                + str(int(time.time() * 1000))
-            )
-
-
-            created = int(time.time())
-
-
             # =================================================
-            # OpenAI 标准第一帧
+            # IMPORTANT
+            #
+            # 不在这里提前发送 role chunk。
+            #
+            # 跟你 Cloudflare Worker 一样：
+            # 等 Gemini 真正开始成功返回之后，
+            # 再发送第一帧 role。
+            #
+            # 这样如果第一个 Key 连接失败，
+            # 仍然可以安全切 Key。
             # =================================================
 
-            first_payload = {
 
-                "id": completion_id,
-
-                "object": "chat.completion.chunk",
-
-                "created": created,
-
-                "model": target_model,
-
-                "choices": [
-                    {
-                        "index": 0,
-
-                        "delta": {
-                            "role": "assistant"
-                        },
-
-                        "finish_reason": None,
-                    }
-                ],
-            }
+            for attempt in range(
+                retry_count
+            ):
 
 
-            yield (
-                "data: "
-                + json.dumps(
-                    first_payload,
-                    ensure_ascii=False
+                current_client = (
+                    get_next_client()
                 )
-                + "\n\n"
-            )
 
 
-            # =================================================
-            # 多 KEY 重试
-            # =================================================
+                gemini_started = False
 
-            for attempt in range(retry_count):
-
-
-                current_client = get_next_client()
-
-
-                # 是否已经从 Gemini 收到正文
-                started = False
+                openai_started = False
 
 
                 try:
@@ -418,7 +926,7 @@ async def chat_completions(req: ChatRequest):
                     response_stream = (
                         await current_client.aio.models.generate_content_stream(
                             model=target_model,
-                            contents=prompt_text,
+                            contents=contents,
                             config=config,
                         )
                     )
@@ -434,84 +942,202 @@ async def chat_completions(req: ChatRequest):
                         )
 
 
+                        # Gemini 已经真实响应
+                        gemini_started = True
+
+
+                        # =====================================
+                        # OpenAI 第一帧
+                        #
+                        # 对齐你的 CF Worker：
+                        #
+                        # role=assistant
+                        # content=""
+                        # =====================================
+
+                        if not openai_started:
+
+
+                            first_payload = {
+
+                                "id":
+                                    completion_id,
+
+                                "object":
+                                    "chat.completion.chunk",
+
+                                "created":
+                                    created,
+
+                                "model":
+                                    target_model,
+
+                                "choices":
+                                    [
+                                        {
+                                            "index":
+                                                0,
+
+                                            "delta":
+                                                {
+                                                    "role":
+                                                        "assistant",
+
+                                                    "content":
+                                                        "",
+                                                },
+
+                                            "finish_reason":
+                                                None,
+                                        }
+                                    ],
+                            }
+
+
+                            yield make_sse(
+                                first_payload
+                            )
+
+
+                            openai_started = True
+
+
+                        # =====================================
+                        # TEXT
+                        # =====================================
+
                         if not text:
                             continue
 
 
-                        started = True
-
-
                         payload = {
 
-                            "id": completion_id,
+                            "id":
+                                completion_id,
 
-                            "object": "chat.completion.chunk",
+                            "object":
+                                "chat.completion.chunk",
 
-                            "created": created,
+                            "created":
+                                created,
 
-                            "model": target_model,
+                            "model":
+                                target_model,
 
-                            "choices": [
-                                {
-                                    "index": 0,
+                            "choices":
+                                [
+                                    {
+                                        "index":
+                                            0,
 
-                                    "delta": {
-                                        "content": text
-                                    },
+                                        "delta":
+                                            {
+                                                "content":
+                                                    text
+                                            },
 
-                                    "finish_reason": None,
-                                }
-                            ],
+                                        "finish_reason":
+                                            None,
+                                    }
+                                ],
                         }
 
 
-                        yield (
-                            "data: "
-                            + json.dumps(
-                                payload,
-                                ensure_ascii=False
-                            )
-                            + "\n\n"
+                        yield make_sse(
+                            payload
                         )
 
 
                     # =================================================
-                    # 正常结束
+                    # Gemini 正常完成，但可能一个文本 chunk 都没有
+                    # =================================================
+
+                    if not openai_started:
+
+
+                        first_payload = {
+
+                            "id":
+                                completion_id,
+
+                            "object":
+                                "chat.completion.chunk",
+
+                            "created":
+                                created,
+
+                            "model":
+                                target_model,
+
+                            "choices":
+                                [
+                                    {
+                                        "index":
+                                            0,
+
+                                        "delta":
+                                            {
+                                                "role":
+                                                    "assistant",
+
+                                                "content":
+                                                    "",
+                                            },
+
+                                        "finish_reason":
+                                            None,
+                                    }
+                                ],
+                        }
+
+
+                        yield make_sse(
+                            first_payload
+                        )
+
+
+                    # =================================================
+                    # FINISH
                     # =================================================
 
                     finish_payload = {
 
-                        "id": completion_id,
+                        "id":
+                            completion_id,
 
-                        "object": "chat.completion.chunk",
+                        "object":
+                            "chat.completion.chunk",
 
-                        "created": created,
+                        "created":
+                            created,
 
-                        "model": target_model,
+                        "model":
+                            target_model,
 
-                        "choices": [
-                            {
-                                "index": 0,
+                        "choices":
+                            [
+                                {
+                                    "index":
+                                        0,
 
-                                "delta": {},
+                                    "delta":
+                                        {},
 
-                                "finish_reason": "stop",
-                            }
-                        ],
+                                    "finish_reason":
+                                        "stop",
+                                }
+                            ],
                     }
 
 
-                    yield (
-                        "data: "
-                        + json.dumps(
-                            finish_payload,
-                            ensure_ascii=False
-                        )
-                        + "\n\n"
+                    yield make_sse(
+                        finish_payload
                     )
 
 
-                    yield "data: [DONE]\n\n"
+                    yield (
+                        "data: [DONE]\n\n"
+                    )
 
 
                     return
@@ -533,176 +1159,299 @@ async def chat_completions(req: ChatRequest):
 
 
                     # =================================================
-                    # 已经输出正文
+                    # Gemini 还没真正开始返回
                     #
-                    # 不能重新生成，否则文本重复
+                    # → 可以安全换 Key
                     # =================================================
 
-                    if started:
+                    if not gemini_started:
 
 
-                        error_payload = {
+                        if (
+                            attempt
+                            < retry_count - 1
+                        ):
 
-                            "id": completion_id,
+                            await asyncio.sleep(
+                                0.5
+                            )
 
-                            "object": "chat.completion.chunk",
+                            continue
 
-                            "created": created,
 
-                            "model": target_model,
+                        # 所有 Key 都失败
+                        break
 
-                            "choices": [
-                                {
-                                    "index": 0,
 
-                                    "delta": {
-                                        "content": (
-                                            "\n\n"
-                                            "[Gemini 流式连接中断: "
-                                            f"{str(e)}]"
-                                        )
-                                    },
+                    # =================================================
+                    # 已经开始生成
+                    #
+                    # 不能重新请求别的 Key，
+                    # 否则回答会从头重复。
+                    # =================================================
 
-                                    "finish_reason": None,
-                                }
-                            ],
+                    if not openai_started:
+
+
+                        first_payload = {
+
+                            "id":
+                                completion_id,
+
+                            "object":
+                                "chat.completion.chunk",
+
+                            "created":
+                                created,
+
+                            "model":
+                                target_model,
+
+                            "choices":
+                                [
+                                    {
+                                        "index":
+                                            0,
+
+                                        "delta":
+                                            {
+                                                "role":
+                                                    "assistant",
+
+                                                "content":
+                                                    "",
+                                            },
+
+                                        "finish_reason":
+                                            None,
+                                    }
+                                ],
                         }
 
 
-                        yield (
-                            "data: "
-                            + json.dumps(
-                                error_payload,
-                                ensure_ascii=False
-                            )
-                            + "\n\n"
+                        yield make_sse(
+                            first_payload
                         )
 
 
-                        finish_payload = {
+                    error_payload = {
 
-                            "id": completion_id,
+                        "id":
+                            completion_id,
 
-                            "object": "chat.completion.chunk",
+                        "object":
+                            "chat.completion.chunk",
 
-                            "created": created,
+                        "created":
+                            created,
 
-                            "model": target_model,
+                        "model":
+                            target_model,
 
-                            "choices": [
+                        "choices":
+                            [
                                 {
-                                    "index": 0,
-                                    "delta": {},
-                                    "finish_reason": "stop",
+                                    "index":
+                                        0,
+
+                                    "delta":
+                                        {
+                                            "content":
+                                                (
+                                                    "\n\n"
+                                                    "[Gemini 流式连接中断: "
+                                                    f"{str(e)}]"
+                                                )
+                                        },
+
+                                    "finish_reason":
+                                        None,
                                 }
                             ],
-                        }
-
-
-                        yield (
-                            "data: "
-                            + json.dumps(
-                                finish_payload,
-                                ensure_ascii=False
-                            )
-                            + "\n\n"
-                        )
-
-
-                        yield "data: [DONE]\n\n"
-
-
-                        return
-
-
-                    # =================================================
-                    # 一个 token 都没输出
-                    #
-                    # 可以安全切换下一个 KEY
-                    # =================================================
-
-                    if attempt < retry_count - 1:
-
-                        await asyncio.sleep(0.5)
-
-                        continue
-
-
-            # =================================================
-            # 所有 KEY 都失败
-            # =================================================
-
-            error_payload = {
-
-                "id": completion_id,
-
-                "object": "chat.completion.chunk",
-
-                "created": created,
-
-                "model": target_model,
-
-                "choices": [
-                    {
-                        "index": 0,
-
-                        "delta": {
-                            "content": (
-                                "[Gemini 请求失败: "
-                                f"{str(last_error)}]"
-                            )
-                        },
-
-                        "finish_reason": None,
                     }
-                ],
+
+
+                    yield make_sse(
+                        error_payload
+                    )
+
+
+                    finish_payload = {
+
+                        "id":
+                            completion_id,
+
+                        "object":
+                            "chat.completion.chunk",
+
+                        "created":
+                            created,
+
+                        "model":
+                            target_model,
+
+                        "choices":
+                            [
+                                {
+                                    "index":
+                                        0,
+
+                                    "delta":
+                                        {},
+
+                                    "finish_reason":
+                                        "stop",
+                                }
+                            ],
+                    }
+
+
+                    yield make_sse(
+                        finish_payload
+                    )
+
+
+                    yield (
+                        "data: [DONE]\n\n"
+                    )
+
+
+                    return
+
+
+            # =================================================
+            # 所有 Key 在开始生成前全部失败
+            #
+            # SSE 已经建立，所以不能再改 HTTP 状态。
+            # 输出 OpenAI 风格结束。
+            # =================================================
+
+
+            first_payload = {
+
+                "id":
+                    completion_id,
+
+                "object":
+                    "chat.completion.chunk",
+
+                "created":
+                    created,
+
+                "model":
+                    target_model,
+
+                "choices":
+                    [
+                        {
+                            "index":
+                                0,
+
+                            "delta":
+                                {
+                                    "role":
+                                        "assistant",
+
+                                    "content":
+                                        "",
+                                },
+
+                            "finish_reason":
+                                None,
+                        }
+                    ],
             }
 
 
-            yield (
-                "data: "
-                + json.dumps(
-                    error_payload,
-                    ensure_ascii=False
-                )
-                + "\n\n"
+            yield make_sse(
+                first_payload
+            )
+
+
+            error_payload = {
+
+                "id":
+                    completion_id,
+
+                "object":
+                    "chat.completion.chunk",
+
+                "created":
+                    created,
+
+                "model":
+                    target_model,
+
+                "choices":
+                    [
+                        {
+                            "index":
+                                0,
+
+                            "delta":
+                                {
+                                    "content":
+                                        (
+                                            "[Gemini 请求失败: "
+                                            f"{str(last_error)}]"
+                                        )
+                                },
+
+                            "finish_reason":
+                                None,
+                        }
+                    ],
+            }
+
+
+            yield make_sse(
+                error_payload
             )
 
 
             finish_payload = {
 
-                "id": completion_id,
+                "id":
+                    completion_id,
 
-                "object": "chat.completion.chunk",
+                "object":
+                    "chat.completion.chunk",
 
-                "created": created,
+                "created":
+                    created,
 
-                "model": target_model,
+                "model":
+                    target_model,
 
-                "choices": [
-                    {
-                        "index": 0,
+                "choices":
+                    [
+                        {
+                            "index":
+                                0,
 
-                        "delta": {},
+                            "delta":
+                                {},
 
-                        "finish_reason": "stop",
-                    }
-                ],
+                            "finish_reason":
+                                "stop",
+                        }
+                    ],
             }
 
 
-            yield (
-                "data: "
-                + json.dumps(
-                    finish_payload,
-                    ensure_ascii=False
-                )
-                + "\n\n"
+            yield make_sse(
+                finish_payload
             )
 
 
-            yield "data: [DONE]\n\n"
+            yield (
+                "data: [DONE]\n\n"
+            )
 
+
+        # =================================================
+        # STREAM RESPONSE
+        # =================================================
 
         return StreamingResponse(
 
@@ -711,12 +1460,18 @@ async def chat_completions(req: ChatRequest):
             media_type="text/event-stream",
 
             headers={
-                "Cache-Control": "no-cache",
-                "Connection": "keep-alive",
-                "X-Accel-Buffering": "no",
 
-                # 防止某些代理转换 SSE
-                "Content-Encoding": "identity",
+                "Cache-Control":
+                    "no-cache, no-transform",
+
+                "Connection":
+                    "keep-alive",
+
+                "X-Accel-Buffering":
+                    "no",
+
+                "Access-Control-Allow-Origin":
+                    "*",
             },
         )
 
@@ -728,10 +1483,14 @@ async def chat_completions(req: ChatRequest):
     last_error = None
 
 
-    for attempt in range(retry_count):
+    for attempt in range(
+        retry_count
+    ):
 
 
-        current_client = get_next_client()
+        current_client = (
+            get_next_client()
+        )
 
 
         try:
@@ -740,38 +1499,64 @@ async def chat_completions(req: ChatRequest):
             response = (
                 await current_client.aio.models.generate_content(
                     model=target_model,
-                    contents=prompt_text,
+                    contents=contents,
                     config=config,
                 )
             )
 
 
-            return {
+            response_text = (
+                getattr(
+                    response,
+                    "text",
+                    None
+                )
+                or ""
+            )
 
-                "id": (
-                    "chatcmpl-gemini-"
-                    + str(int(time.time() * 1000))
-                ),
 
-                "object": "chat.completion",
+            return JSONResponse(
+                content={
+                    "id":
+                        make_completion_id(),
 
-                "created": int(time.time()),
+                    "object":
+                        "chat.completion",
 
-                "model": target_model,
+                    "created":
+                        int(
+                            time.time()
+                        ),
 
-                "choices": [
-                    {
-                        "index": 0,
+                    "model":
+                        target_model,
 
-                        "message": {
-                            "role": "assistant",
-                            "content": response.text or "",
-                        },
+                    "choices":
+                        [
+                            {
+                                "index":
+                                    0,
 
-                        "finish_reason": "stop",
-                    }
-                ],
-            }
+                                "message":
+                                    {
+                                        "role":
+                                            "assistant",
+
+                                        "content":
+                                            response_text,
+                                    },
+
+                                "finish_reason":
+                                    "stop",
+                            }
+                        ],
+                },
+
+                headers={
+                    "Access-Control-Allow-Origin":
+                        "*"
+                }
+            )
 
 
         except Exception as e:
@@ -789,35 +1574,46 @@ async def chat_completions(req: ChatRequest):
             )
 
 
-            if attempt < retry_count - 1:
+            if (
+                attempt
+                < retry_count - 1
+            ):
 
-                await asyncio.sleep(0.5)
+                await asyncio.sleep(
+                    0.5
+                )
 
 
     # =====================================================
-    # 所有 KEY 都失败
+    # NON STREAM 全部 KEY 失败
     # =====================================================
 
     raise HTTPException(
-
         status_code=503,
-
         detail={
-            "message": "所有 Gemini API Key 请求均失败",
+            "message":
+                "所有 Gemini API Key 请求均失败",
 
-            "model": target_model,
+            "model":
+                target_model,
 
-            "error_type": (
-                type(last_error).__name__
-                if last_error
-                else None
-            ),
+            "error_type":
+                (
+                    type(
+                        last_error
+                    ).__name__
+                    if last_error
+                    else None
+                ),
 
-            "error": (
-                str(last_error)
-                if last_error
-                else "Unknown error"
-            ),
+            "error":
+                (
+                    str(
+                        last_error
+                    )
+                    if last_error
+                    else "Unknown error"
+                ),
         },
     )
 
