@@ -1,28 +1,33 @@
 import os
+import time
+import json
 import itertools
 from fastapi import FastAPI, HTTPException
-from fastapi.responses import StreamingResponse
+from fastapi.responses import StreamingResponse, JSONResponse
 from pydantic import BaseModel
 from typing import List, Optional
 from google import genai
 from google.genai import types
-from google.genai.errors import APIError
+from google.genai.errors import APIError, ServerError
 
-app = FastAPI(title="Gemini Multi-Key Router")
+app = FastAPI(title="Gemini 3.7 Flash Dedicated Router")
 
-# 从环境变量读取多个 API Key（用英文逗号分隔）
+# 首页健康检查（解决访问根目录 404 的问题）
+@app.get("/")
+async def root():
+    return {"status": "running", "service": "Gemini 3.7 Flash Dedicated Router"}
+
+# 从环境变量读取多个 API Key（逗号分隔）
 keys_env = os.environ.get("GEMINI_API_KEYS", "")
 API_KEYS = [k.strip() for k in keys_env.split(",") if k.strip()]
-
 key_cycle = itertools.cycle(API_KEYS) if API_KEYS else None
 
 def get_next_client() -> genai.Client:
     if not key_cycle:
         raise HTTPException(status_code=500, detail="请在 Zeabur 环境变量中设置 GEMINI_API_KEYS")
-    key = next(key_cycle)
-    return genai.Client(api_key=key)
+    return genai.Client(api_key=next(key_cycle))
 
-# 强制完全解除四大审核过滤 (BLOCK_NONE)
+# 全解审核过滤 (BLOCK_NONE)
 GLOBAL_SAFETY_SETTINGS = [
     types.SafetySetting(
         category=types.HarmCategory.HARM_CATEGORY_HATE_SPEECH,
@@ -50,11 +55,12 @@ class ChatRequest(BaseModel):
     model: Optional[str] = "gemini-3.7-flash"
     messages: List[ChatMessage]
     stream: Optional[bool] = True
-    thinking_budget: Optional[int] = 8192  # 默认高深度思考
+    thinking_budget: Optional[int] = 4096
 
 @app.post("/v1/chat/completions")
 async def chat_completions(req: ChatRequest):
     prompt_text = "\n".join([f"{msg.role}: {msg.content}" for msg in req.messages])
+    target_model = "gemini-3.7-flash"
     
     config = types.GenerateContentConfig(
         safety_settings=GLOBAL_SAFETY_SETTINGS,
@@ -63,43 +69,78 @@ async def chat_completions(req: ChatRequest):
         ) if req.thinking_budget and req.thinking_budget > 0 else None
     )
 
-    last_err = None
-    for _ in range(len(API_KEYS) if API_KEYS else 1):
+    last_err_msg = ""
+    retry_count = max(len(API_KEYS), 1)
+
+    for attempt in range(retry_count):
         try:
             client = get_next_client()
+            
             if req.stream:
+                stream_obj = client.models.generate_content_stream(
+                    model=target_model,
+                    contents=prompt_text,
+                    config=config,
+                )
+                
                 def event_stream():
-                    response_stream = client.models.generate_content_stream(
-                        model=req.model,
-                        contents=prompt_text,
-                        config=config,
-                    )
-                    for chunk in response_stream:
-                        if chunk.text:
-                            yield f"data: {{\"choices\": [{{\"delta\": {{\"content\": {repr(chunk.text)}}} }}]}}\n\n"
-                    yield "data: [DONE]\n\n"
+                    try:
+                        for chunk in stream_obj:
+                            if chunk.text:
+                                # 使用标准的 json.dumps，确保双引号与转义 100% 正确
+                                chunk_payload = {
+                                    "id": "chatcmpl-gemini",
+                                    "object": "chat.completion.chunk",
+                                    "created": int(time.time()),
+                                    "model": target_model,
+                                    "choices": [{
+                                        "index": 0,
+                                        "delta": {"content": chunk.text},
+                                        "finish_reason": None
+                                    }]
+                                }
+                                yield f"data: {json.dumps(chunk_payload, ensure_ascii=False)}\n\n"
+                        yield "data: [DONE]\n\n"
+                    except Exception as stream_err:
+                        err_payload = {
+                            "choices": [{"delta": {"content": f"\n\n[网络中断: {str(stream_err)}]"}}]
+                        }
+                        yield f"data: {json.dumps(err_payload, ensure_ascii=False)}\n\n"
+                        yield "data: [DONE]\n\n"
 
-                return StreamingResponse(event_stream(), media_type="text/event-stream")
+                return StreamingResponse(
+                    event_stream(),
+                    media_type="text/event-stream",
+                    headers={
+                        "Cache-Control": "no-cache",
+                        "Connection": "keep-alive",
+                        "X-Accel-Buffering": "no"
+                    }
+                )
             else:
                 response = client.models.generate_content(
-                    model=req.model,
+                    model=target_model,
                     contents=prompt_text,
                     config=config,
                 )
                 return {
+                    "id": "chatcmpl-gemini",
+                    "object": "chat.completion",
+                    "created": int(time.time()),
+                    "model": target_model,
                     "choices": [{
-                        "message": {"role": "assistant", "content": response.text}
+                        "message": {"role": "assistant", "content": response.text},
+                        "finish_reason": "stop"
                     }]
                 }
-        except APIError as e:
-            print(f"[Warn] Key 触发异常 (Code {e.code})，正在切换下一个 Key...")
-            last_err = e
-            continue
-        except Exception as e:
-            last_err = e
+
+        except (ServerError, APIError, Exception) as e:
+            last_err_msg = str(e)
+            print(f"[Warn] 3.7 Flash 遇到重试: {last_err_msg}，正在切下一个 Key...")
+            time.sleep(1)
             continue
 
-    raise HTTPException(status_code=500, detail=f"请求失败: {str(last_err)}")
+    raise HTTPException(status_code=503, detail=f"Gemini 3.7 Flash 请求失败: {last_err_msg}")
 
 if __name__ == "__main__":
     import uvicorn
