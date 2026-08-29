@@ -3,7 +3,7 @@ import time
 import json
 import itertools
 from fastapi import FastAPI, HTTPException
-from fastapi.responses import StreamingResponse, JSONResponse
+from fastapi.responses import StreamingResponse
 from pydantic import BaseModel
 from typing import List, Optional
 from google import genai
@@ -12,20 +12,18 @@ from google.genai.errors import APIError, ServerError
 
 app = FastAPI(title="Gemini 3.7 Flash Dedicated Router")
 
-# 首页健康检查（解决访问根目录 404 的问题）
-@app.get("/")
-async def root():
-    return {"status": "running", "service": "Gemini 3.7 Flash Dedicated Router"}
-
-# 从环境变量读取多个 API Key（逗号分隔）
+# 从环境变量读取多个 API Key
 keys_env = os.environ.get("GEMINI_API_KEYS", "")
 API_KEYS = [k.strip() for k in keys_env.split(",") if k.strip()]
-key_cycle = itertools.cycle(API_KEYS) if API_KEYS else None
+
+# 全局初始化持久化客户端池（常驻内存，彻底防止连接被提前关闭）
+CLIENT_POOL = [genai.Client(api_key=k) for k in API_KEYS] if API_KEYS else []
+client_cycle = itertools.cycle(CLIENT_POOL) if CLIENT_POOL else None
 
 def get_next_client() -> genai.Client:
-    if not key_cycle:
+    if not client_cycle:
         raise HTTPException(status_code=500, detail="请在 Zeabur 环境变量中设置 GEMINI_API_KEYS")
-    return genai.Client(api_key=next(key_cycle))
+    return next(client_cycle)
 
 # 全解审核过滤 (BLOCK_NONE)
 GLOBAL_SAFETY_SETTINGS = [
@@ -57,6 +55,14 @@ class ChatRequest(BaseModel):
     stream: Optional[bool] = True
     thinking_budget: Optional[int] = 4096
 
+@app.get("/")
+async def root():
+    return {
+        "status": "running",
+        "service": "Gemini 3.7 Flash Dedicated Router",
+        "loaded_keys_count": len(CLIENT_POOL)
+    }
+
 @app.post("/v1/chat/completions")
 async def chat_completions(req: ChatRequest):
     prompt_text = "\n".join([f"{msg.role}: {msg.content}" for msg in req.messages])
@@ -70,24 +76,24 @@ async def chat_completions(req: ChatRequest):
     )
 
     last_err_msg = ""
-    retry_count = max(len(API_KEYS), 1)
+    retry_count = max(len(CLIENT_POOL), 1)
 
     for attempt in range(retry_count):
         try:
-            client = get_next_client()
+            # 获取持久化的 Client 引用
+            current_client = get_next_client()
             
             if req.stream:
-                stream_obj = client.models.generate_content_stream(
-                    model=target_model,
-                    contents=prompt_text,
-                    config=config,
-                )
-                
-                def event_stream():
+                def event_stream(c=current_client):
                     try:
-                        for chunk in stream_obj:
+                        # 在生成器内部保持 client 存活并执行流式生成
+                        response_stream = c.models.generate_content_stream(
+                            model=target_model,
+                            contents=prompt_text,
+                            config=config,
+                        )
+                        for chunk in response_stream:
                             if chunk.text:
-                                # 使用标准的 json.dumps，确保双引号与转义 100% 正确
                                 chunk_payload = {
                                     "id": "chatcmpl-gemini",
                                     "object": "chat.completion.chunk",
@@ -103,7 +109,15 @@ async def chat_completions(req: ChatRequest):
                         yield "data: [DONE]\n\n"
                     except Exception as stream_err:
                         err_payload = {
-                            "choices": [{"delta": {"content": f"\n\n[网络中断: {str(stream_err)}]"}}]
+                            "id": "chatcmpl-err",
+                            "object": "chat.completion.chunk",
+                            "created": int(time.time()),
+                            "model": target_model,
+                            "choices": [{
+                                "index": 0,
+                                "delta": {"content": f"\n\n[连接异常: {str(stream_err)}]"},
+                                "finish_reason": "stop"
+                            }]
                         }
                         yield f"data: {json.dumps(err_payload, ensure_ascii=False)}\n\n"
                         yield "data: [DONE]\n\n"
@@ -118,7 +132,7 @@ async def chat_completions(req: ChatRequest):
                     }
                 )
             else:
-                response = client.models.generate_content(
+                response = current_client.models.generate_content(
                     model=target_model,
                     contents=prompt_text,
                     config=config,
@@ -136,7 +150,7 @@ async def chat_completions(req: ChatRequest):
 
         except (ServerError, APIError, Exception) as e:
             last_err_msg = str(e)
-            print(f"[Warn] 3.7 Flash 遇到重试: {last_err_msg}，正在切下一个 Key...")
+            print(f"[Warn] 触发重试: {last_err_msg}")
             time.sleep(1)
             continue
 
